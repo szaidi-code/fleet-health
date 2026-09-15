@@ -1,0 +1,74 @@
+#!/bin/bash
+# omarchy:summary=Query live Fleet DM server status and enrolled hosts
+# omarchy:group=fleet
+
+set -euo pipefail
+
+resolve_fleet_url() {
+  if [[ -n "${FLEET_SERVER_URL:-}" ]]; then
+    echo "$FLEET_SERVER_URL"
+    return
+  fi
+  if [[ -f "${HOME}/.fleet/config" ]]; then
+    local addr
+    addr=$(grep -E '^\s*address:' "${HOME}/.fleet/config" 2>/dev/null | head -n1 | awk '{print $2}' | tr -d '"'\'' ' || true)
+    if [[ -n "$addr" ]]; then
+      echo "$addr"
+      return
+    fi
+  fi
+  echo "https://localhost:1337"
+}
+
+FLEET_SERVER_URL="$(resolve_fleet_url)"
+
+if ! command -v fleetctl >/dev/null 2>&1; then
+  cat <<'EOF'
+{
+  "connected": false,
+  "server_url": "",
+  "total_hosts": 0,
+  "online_hosts": 0,
+  "offline_hosts": 0,
+  "hosts": [],
+  "error": "fleetctl command not found in PATH"
+}
+EOF
+  exit 0
+fi
+
+raw_hosts=$(fleetctl get hosts --json 2>/dev/null || true)
+
+if [[ -z "$raw_hosts" ]]; then
+  cat <<EOF
+{
+  "connected": false,
+  "server_url": "$FLEET_SERVER_URL",
+  "total_hosts": 0,
+  "online_hosts": 0,
+  "offline_hosts": 0,
+  "hosts": [],
+  "error": "Unable to connect to Fleet DM server"
+}
+EOF
+  exit 0
+fi
+
+jq -s --arg url "$FLEET_SERVER_URL" '{
+  connected: true,
+  server_url: $url,
+  total_hosts: length,
+  online_hosts: ([.[] | select(.spec.status == "online")] | length),
+  offline_hosts: ([.[] | select(.spec.status != "online")] | length),
+  hosts: [.[] | {
+    id: .spec.id,
+    hostname: .spec.hostname,
+    computer_name: (.spec.computer_name // .spec.hostname),
+    ip: (.spec.primary_ip // "unknown"),
+    status: .spec.status,
+    os: (.spec.os_version // "Linux"),
+    osquery: (.spec.osquery_version // "unknown"),
+    issues: ((.spec.issues.total_issues_count) // 0),
+    disk_free_percent: ((.spec.percent_disk_space_available) // 0)
+  }]
+}' <<<"$raw_hosts"

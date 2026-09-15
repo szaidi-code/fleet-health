@@ -1,0 +1,18 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs and environment
+*.log
+.env
+.fleet/
+
+# OS artifacts
+.DS_Store
+Thumbs.db

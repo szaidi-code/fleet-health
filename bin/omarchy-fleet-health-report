@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""
+Omarchy Fleet Health Report Collector
+Queries live osquery telemetry (CPU, memory, kernel status, uptime) from Fleet DM.
+"""
+
+import subprocess
+import json
+import re
+import sys
+import os
+import datetime
+import argparse
+
+def resolve_fleet_url(override=None):
+    if override:
+        return override.rstrip("/")
+    if os.environ.get("FLEET_SERVER_URL"):
+        return os.environ["FLEET_SERVER_URL"].rstrip("/")
+    
+    # Try reading context from ~/.fleet/config
+    fleet_cfg_path = os.path.expanduser("~/.fleet/config")
+    if os.path.exists(fleet_cfg_path):
+        try:
+            with open(fleet_cfg_path, "r", encoding="utf-8") as f:
+                content = f.read()
+                # Parse address without requiring pyyaml if not installed
+                addr_match = re.search(r'address:\s*["\']?([^"\'\s\n]+)["\']?', content)
+                if addr_match:
+                    return addr_match.group(1).rstrip("/")
+        except Exception:
+            pass
+
+    return "https://localhost:1337"
+
+def get_demo_data(server_url="https://fleet.example.internal:1337"):
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    return {
+        "timestamp": now_iso,
+        "server_url": server_url or "https://fleet.example.internal:1337",
+        "connected": True,
+        "summary": {
+            "total_nodes": 4,
+            "online_nodes": 4,
+            "offline_nodes": 0,
+            "avg_load_1m": 0.18,
+            "total_ram_gb": 16.0,
+            "used_ram_gb": 1.2,
+            "ram_percent": 7.5,
+            "kernel_version": "6.12.10-arch1-1",
+            "status": "Healthy"
+        },
+        "nodes": [
+            {
+                "id": 1,
+                "hostname": "fleet-node-01.internal",
+                "display_name": "fleet-node-01",
+                "ip": "10.0.1.11",
+                "status": "online",
+                "os": "Arch Linux rolling",
+                "osquery": "5.23.1",
+                "disk_free_percent": 82,
+                "cpu": {
+                    "brand": "AMD Ryzen 9 7940HS w/ Radeon 780M Graphics",
+                    "cores": 8,
+                    "load_1m": 0.18,
+                    "load_5m": 0.14
+                },
+                "memory": {
+                    "total_mb": 4096,
+                    "used_mb": 312,
+                    "free_mb": 2450,
+                    "cached_mb": 1334,
+                    "percent": 7.6
+                },
+                "kernel": {
+                    "version": "6.12.10-arch1-1",
+                    "arguments": "ro quiet splash",
+                    "uptime_human": "5d 12h 40m",
+                    "uptime_seconds": 477640
+                }
+            },
+            {
+                "id": 2,
+                "hostname": "fleet-node-02.internal",
+                "display_name": "fleet-node-02",
+                "ip": "10.0.1.12",
+                "status": "online",
+                "os": "Arch Linux rolling",
+                "osquery": "5.23.1",
+                "disk_free_percent": 84,
+                "cpu": {
+                    "brand": "AMD Ryzen 9 7940HS w/ Radeon 780M Graphics",
+                    "cores": 8,
+                    "load_1m": 0.15,
+                    "load_5m": 0.12
+                },
+                "memory": {
+                    "total_mb": 4096,
+                    "used_mb": 290,
+                    "free_mb": 2800,
+                    "cached_mb": 1006,
+                    "percent": 7.1
+                },
+                "kernel": {
+                    "version": "6.12.10-arch1-1",
+                    "arguments": "ro quiet splash",
+                    "uptime_human": "5d 12h 38m",
+                    "uptime_seconds": 477520
+                }
+            },
+            {
+                "id": 3,
+                "hostname": "fleet-node-03.internal",
+                "display_name": "fleet-node-03",
+                "ip": "10.0.1.13",
+                "status": "online",
+                "os": "Arch Linux rolling",
+                "osquery": "5.23.1",
+                "disk_free_percent": 79,
+                "cpu": {
+                    "brand": "AMD Ryzen 9 7940HS w/ Radeon 780M Graphics",
+                    "cores": 8,
+                    "load_1m": 0.22,
+                    "load_5m": 0.19
+                },
+                "memory": {
+                    "total_mb": 4096,
+                    "used_mb": 350,
+                    "free_mb": 2300,
+                    "cached_mb": 1446,
+                    "percent": 8.5
+                },
+                "kernel": {
+                    "version": "6.12.10-arch1-1",
+                    "arguments": "ro quiet splash",
+                    "uptime_human": "5d 12h 35m",
+                    "uptime_seconds": 477300
+                }
+            },
+            {
+                "id": 4,
+                "hostname": "fleet-node-04.internal",
+                "display_name": "fleet-node-04",
+                "ip": "10.0.1.14",
+                "status": "online",
+                "os": "Arch Linux rolling",
+                "osquery": "5.23.1",
+                "disk_free_percent": 88,
+                "cpu": {
+                    "brand": "AMD Ryzen 9 7940HS w/ Radeon 780M Graphics",
+                    "cores": 8,
+                    "load_1m": 0.16,
+                    "load_5m": 0.11
+                },
+                "memory": {
+                    "total_mb": 4096,
+                    "used_mb": 248,
+                    "free_mb": 3100,
+                    "cached_mb": 748,
+                    "percent": 6.1
+                },
+                "kernel": {
+                    "version": "6.12.10-arch1-1",
+                    "arguments": "ro quiet splash",
+                    "uptime_human": "5d 12h 32m",
+                    "uptime_seconds": 477120
+                }
+            }
+        ]
+    }
+
+def get_fleet_data(server_url, timeout_sec=8):
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    # 1. Check if fleetctl is installed
+    try:
+        ver_chk = subprocess.run(["fleetctl", "--version"], capture_output=True, text=True)
+        if ver_chk.returncode != 0:
+            return {
+                "timestamp": now_iso,
+                "server_url": server_url,
+                "connected": False,
+                "error": "fleetctl command failed or not configured",
+                "summary": {"total_nodes": 0, "online_nodes": 0, "offline_nodes": 0, "status": "Disconnected"},
+                "nodes": []
+            }
+    except FileNotFoundError:
+        return {
+            "timestamp": now_iso,
+            "server_url": server_url,
+            "connected": False,
+            "error": "fleetctl binary not found in PATH",
+            "summary": {"total_nodes": 0, "online_nodes": 0, "offline_nodes": 0, "status": "Disconnected"},
+            "nodes": []
+        }
+
+    # 2. Query basic host information
+    hosts = {}
+    try:
+        hosts_res = subprocess.run(["fleetctl", "get", "hosts", "--json"], capture_output=True, text=True, timeout=10)
+        if hosts_res.returncode == 0 and hosts_res.stdout.strip():
+            for line in hosts_res.stdout.strip().split("\n"):
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                    spec = item.get("spec", {})
+                    h_name = spec.get("hostname")
+                    if h_name:
+                        mem_bytes = int(spec.get("memory", 0))
+                        hosts[h_name] = {
+                            "id": spec.get("id"),
+                            "hostname": h_name,
+                            "display_name": spec.get("computer_name") or spec.get("display_name") or h_name,
+                            "ip": spec.get("primary_ip", "unknown"),
+                            "status": spec.get("status", "unknown"),
+                            "os": spec.get("os_version", "Arch Linux"),
+                            "osquery": spec.get("osquery_version", "5.23.1"),
+                            "disk_free_percent": spec.get("percent_disk_space_available", 0),
+                            "cpu": {
+                                "brand": (spec.get("cpu_brand") or "AMD Ryzen").strip(),
+                                "cores": spec.get("cpu_logical_cores", 4),
+                                "load_1m": 0.0,
+                                "load_5m": 0.0
+                            },
+                            "memory": {
+                                "total_mb": round(mem_bytes / (1024 * 1024)) if mem_bytes > 0 else 4096,
+                                "used_mb": 0,
+                                "free_mb": 0,
+                                "cached_mb": 0,
+                                "percent": 0.0
+                            },
+                            "kernel": {
+                                "version": "unknown",
+                                "arguments": "",
+                                "uptime_human": "",
+                                "uptime_seconds": 0
+                            }
+                        }
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    if not hosts:
+        return {
+            "timestamp": now_iso,
+            "server_url": server_url,
+            "connected": False,
+            "error": "No hosts registered or Fleet server unreachable",
+            "summary": {"total_nodes": 0, "online_nodes": 0, "offline_nodes": 0, "status": "Offline"},
+            "nodes": []
+        }
+
+    # 3. Query live osquery telemetry via saved report 'fleet_health_report'
+    try:
+        timeout_arg = f"{int(timeout_sec)}s"
+        rep_res = subprocess.run(
+            ["fleetctl", "report", "--report-name", "fleet_health_report", "--labels", "All Hosts", "--timeout", timeout_arg],
+            capture_output=True, text=True, timeout=timeout_sec + 4
+        )
+        if rep_res.stdout:
+            for line in rep_res.stdout.split("\n"):
+                match = re.search(r"\{.*\"host\":.*\"rows\":.*\}", line)
+                if not match:
+                    continue
+                try:
+                    rec = json.loads(match.group(0))
+                    h_name = rec.get("host")
+                    rows = rec.get("rows", [])
+                    if h_name in hosts and rows:
+                        r = rows[0]
+                        mem_tot = int(r.get("memory_total", 0))
+                        mem_free = int(r.get("memory_free", 0))
+                        mem_cached = int(r.get("cached", 0))
+                        mem_used = max(0, mem_tot - mem_free - mem_cached)
+                        mem_pct = round((mem_used / mem_tot) * 100, 1) if mem_tot > 0 else 0
+                        uptime_s = int(r.get("uptime_seconds", 0))
+                        days = uptime_s // 86400
+                        hours = (uptime_s % 86400) // 3600
+                        mins = (uptime_s % 3600) // 60
+                        uptime_str = f"{days}d {hours}h {mins}m" if days > 0 else f"{hours}h {mins}m"
+
+                        hosts[h_name]["cpu"]["load_1m"] = round(float(r.get("load_1m", 0)), 2)
+                        hosts[h_name]["cpu"]["load_5m"] = round(float(r.get("load_5m", 0)), 2)
+                        if r.get("cpu_brand"):
+                            hosts[h_name]["cpu"]["brand"] = r.get("cpu_brand").strip()
+                        if mem_tot > 0:
+                            hosts[h_name]["memory"]["total_mb"] = round(mem_tot / (1024 * 1024))
+                            hosts[h_name]["memory"]["used_mb"] = round(mem_used / (1024 * 1024))
+                            hosts[h_name]["memory"]["free_mb"] = round(mem_free / (1024 * 1024))
+                            hosts[h_name]["memory"]["cached_mb"] = round(mem_cached / (1024 * 1024))
+                            hosts[h_name]["memory"]["percent"] = mem_pct
+                        if r.get("kernel_version"):
+                            hosts[h_name]["kernel"]["version"] = r.get("kernel_version")
+                        if r.get("kernel_args"):
+                            hosts[h_name]["kernel"]["arguments"] = r.get("kernel_args")
+                        hosts[h_name]["kernel"]["uptime_human"] = uptime_str
+                        hosts[h_name]["kernel"]["uptime_seconds"] = uptime_s
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    node_list = list(hosts.values())
+    online_count = sum(1 for n in node_list if n.get("status") == "online")
+    total_count = len(node_list)
+    offline_count = total_count - online_count
+
+    loads = [n["cpu"]["load_1m"] for n in node_list if n["cpu"]["load_1m"] > 0]
+    avg_load = round(sum(loads) / len(loads), 2) if loads else 0.0
+
+    total_ram_mb = sum(n["memory"]["total_mb"] for n in node_list)
+    used_ram_mb = sum(n["memory"]["used_mb"] for n in node_list)
+    total_ram_gb = round(total_ram_mb / 1024, 1)
+    used_ram_gb = round(used_ram_mb / 1024, 1)
+    ram_pct = round((used_ram_mb / total_ram_mb) * 100, 1) if total_ram_mb > 0 else 0.0
+
+    cluster_status = "Healthy"
+    if offline_count > 0:
+        cluster_status = "Warning" if online_count > 0 else "Degraded"
+
+    kernel_versions = list({n["kernel"]["version"] for n in node_list if n["kernel"]["version"] != "unknown"})
+    kernel_display = kernel_versions[0] if kernel_versions else "Linux"
+
+    return {
+        "timestamp": now_iso,
+        "server_url": server_url,
+        "connected": True,
+        "summary": {
+            "total_nodes": total_count,
+            "online_nodes": online_count,
+            "offline_nodes": offline_count,
+            "avg_load_1m": avg_load,
+            "total_ram_gb": total_ram_gb,
+            "used_ram_gb": used_ram_gb,
+            "ram_percent": ram_pct,
+            "kernel_version": kernel_display,
+            "status": cluster_status
+        },
+        "nodes": node_list
+    }
+
+def main():
+    parser = argparse.ArgumentParser(description="Omarchy Fleet DM Health Report")
+    parser.add_argument("--server-url", help="Fleet DM server URL override")
+    parser.add_argument("--demo", "--mock", action="store_true", help="Output sanitized demo telemetry for testing or previews")
+    parser.add_argument("--timeout", type=int, default=8, help="Timeout in seconds for live query")
+    args = parser.parse_args()
+
+    server_url = resolve_fleet_url(args.server_url)
+
+    if args.demo:
+        report = get_demo_data(args.server_url)
+    else:
+        report = get_fleet_data(server_url, timeout_sec=args.timeout)
+
+    print(json.dumps(report, indent=2))
+
+if __name__ == "__main__":
+    main()
