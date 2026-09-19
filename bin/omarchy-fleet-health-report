@@ -351,7 +351,7 @@ def main():
 
     server_url = resolve_fleet_url(args.server_url)
 
-    if args.demo:
+    if args.demo or os.path.exists(os.path.expanduser("~/.config/omarchy/fleet-demo")):
         report = get_demo_data(args.server_url)
     else:
         report = get_fleet_data(server_url, timeout_sec=args.timeout)

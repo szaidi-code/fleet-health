@@ -79,5 +79,19 @@ class TestFleetPlugin(unittest.TestCase):
         self.assertIn("connected", data)
         self.assertIn("total_hosts", data)
 
+    def test_install_and_uninstall_scripts(self):
+        install_sh = PLUGIN_DIR / "install.sh"
+        uninstall_sh = PLUGIN_DIR / "uninstall.sh"
+        self.assertTrue(install_sh.is_file(), "install.sh must exist")
+        self.assertTrue(uninstall_sh.is_file(), "uninstall.sh must exist")
+        self.assertTrue(os.access(install_sh, os.X_OK), "install.sh must be executable")
+        self.assertTrue(os.access(uninstall_sh, os.X_OK), "uninstall.sh must be executable")
+
+        # Check bash syntax with -n
+        res_inst = subprocess.run(["bash", "-n", str(install_sh)], capture_output=True, text=True)
+        self.assertEqual(res_inst.returncode, 0, f"install.sh syntax error: {res_inst.stderr}")
+        res_uninst = subprocess.run(["bash", "-n", str(uninstall_sh)], capture_output=True, text=True)
+        self.assertEqual(res_uninst.returncode, 0, f"uninstall.sh syntax error: {res_uninst.stderr}")
+
 if __name__ == "__main__":
     unittest.main()

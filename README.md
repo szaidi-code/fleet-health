@@ -3,7 +3,7 @@
 A bar widget and status panel for [Omarchy](https://github.com/omacom/omarchy) that connects to [Fleet DM](https://fleetdm.com/) to monitor cluster node health, live osquery telemetry, and swarm status.
 
 <p align="center">
-  <img src="preview.png" alt="Fleet DM Health Preview" width="380">
+  <img src="preview.png" alt="Fleet DM Health Preview" width="100%">
 </p>
 
 ## Features
@@ -85,4 +85,19 @@ Ensure `fleet.health` is included in your bar widgets in `~/.config/omarchy/shel
   }
 }
 ```
+
+## Removal
+
+To completely remove the `fleet.health` plugin and its installed helper scripts:
+
+```bash
+./uninstall.sh
+```
+
+Then remove `"fleet.health"` from your bar layout in `~/.config/omarchy/shell.json` and reload or restart your Omarchy shell.
+
+## License
+
+[MIT License](LICENSE) — Copyright (c) 2026 szaidi-code.
+
 
