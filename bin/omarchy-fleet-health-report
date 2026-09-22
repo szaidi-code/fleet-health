@@ -12,6 +12,23 @@ import os
 import datetime
 import argparse
 
+SAFE_IP_PATTERN = re.compile(r'^[a-zA-Z0-9:][a-zA-Z0-9.:_-]{0,254}$')
+SAFE_STR_PATTERN = re.compile(r'[\x00-\x1f\x7f]')
+
+def sanitize_ip(ip_val):
+    if not ip_val or not isinstance(ip_val, str):
+        return "unknown"
+    cleaned = ip_val.strip()
+    if SAFE_IP_PATTERN.match(cleaned):
+        return cleaned
+    return "unknown"
+
+def sanitize_text(val, default="unknown", max_len=255):
+    if val is None:
+        return default
+    s = SAFE_STR_PATTERN.sub('', str(val)).strip()
+    return s[:max_len] if s else default
+
 def resolve_fleet_url(override=None):
     if override:
         return override.rstrip("/")
@@ -206,21 +223,25 @@ def get_fleet_data(server_url, timeout_sec=8):
                 try:
                     item = json.loads(line)
                     spec = item.get("spec", {})
-                    h_name = spec.get("hostname")
+                    h_name = sanitize_text(spec.get("hostname"), default="", max_len=128)
                     if h_name:
-                        mem_bytes = int(spec.get("memory", 0))
+                        mem_val = spec.get("memory", 0)
+                        try:
+                            mem_bytes = int(mem_val)
+                        except (ValueError, TypeError):
+                            mem_bytes = 0
                         hosts[h_name] = {
                             "id": spec.get("id"),
                             "hostname": h_name,
-                            "display_name": spec.get("computer_name") or spec.get("display_name") or h_name,
-                            "ip": spec.get("primary_ip", "unknown"),
-                            "status": spec.get("status", "unknown"),
-                            "os": spec.get("os_version", "Arch Linux"),
-                            "osquery": spec.get("osquery_version", "5.23.1"),
-                            "disk_free_percent": spec.get("percent_disk_space_available", 0),
+                            "display_name": sanitize_text(spec.get("computer_name") or spec.get("display_name") or h_name, default=h_name, max_len=128),
+                            "ip": sanitize_ip(spec.get("primary_ip")),
+                            "status": sanitize_text(spec.get("status", "unknown"), default="unknown", max_len=32),
+                            "os": sanitize_text(spec.get("os_version", "Arch Linux"), default="Arch Linux", max_len=64),
+                            "osquery": sanitize_text(spec.get("osquery_version", "5.23.1"), default="5.23.1", max_len=32),
+                            "disk_free_percent": int(spec.get("percent_disk_space_available", 0)) if str(spec.get("percent_disk_space_available", 0)).isdigit() else 0,
                             "cpu": {
-                                "brand": (spec.get("cpu_brand") or "AMD Ryzen").strip(),
-                                "cores": spec.get("cpu_logical_cores", 4),
+                                "brand": sanitize_text(spec.get("cpu_brand") or "AMD Ryzen", default="AMD Ryzen", max_len=128),
+                                "cores": int(spec.get("cpu_logical_cores", 4)) if str(spec.get("cpu_logical_cores", 4)).isdigit() else 4,
                                 "load_1m": 0.0,
                                 "load_5m": 0.0
                             },
@@ -285,7 +306,7 @@ def get_fleet_data(server_url, timeout_sec=8):
                         hosts[h_name]["cpu"]["load_1m"] = round(float(r.get("load_1m", 0)), 2)
                         hosts[h_name]["cpu"]["load_5m"] = round(float(r.get("load_5m", 0)), 2)
                         if r.get("cpu_brand"):
-                            hosts[h_name]["cpu"]["brand"] = r.get("cpu_brand").strip()
+                            hosts[h_name]["cpu"]["brand"] = sanitize_text(r.get("cpu_brand"), default="AMD Ryzen", max_len=128)
                         if mem_tot > 0:
                             hosts[h_name]["memory"]["total_mb"] = round(mem_tot / (1024 * 1024))
                             hosts[h_name]["memory"]["used_mb"] = round(mem_used / (1024 * 1024))
@@ -293,9 +314,9 @@ def get_fleet_data(server_url, timeout_sec=8):
                             hosts[h_name]["memory"]["cached_mb"] = round(mem_cached / (1024 * 1024))
                             hosts[h_name]["memory"]["percent"] = mem_pct
                         if r.get("kernel_version"):
-                            hosts[h_name]["kernel"]["version"] = r.get("kernel_version")
+                            hosts[h_name]["kernel"]["version"] = sanitize_text(r.get("kernel_version"), default="unknown", max_len=64)
                         if r.get("kernel_args"):
-                            hosts[h_name]["kernel"]["arguments"] = r.get("kernel_args")
+                            hosts[h_name]["kernel"]["arguments"] = sanitize_text(r.get("kernel_args"), default="", max_len=255)
                         hosts[h_name]["kernel"]["uptime_human"] = uptime_str
                         hosts[h_name]["kernel"]["uptime_seconds"] = uptime_s
                 except Exception:

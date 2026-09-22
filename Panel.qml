@@ -53,9 +53,31 @@ Panel {
   }
 
   function copyText(val, label) {
-    if (root.bar && typeof root.bar.run === "function") {
-      root.bar.run("wl-copy " + val)
-      root.bar.run("omarchy-notification-send -g 󰒋 'Fleet DM' 'Copied " + label + ": " + val + "'")
+    var rawVal = String(val || "").trim()
+    // Strict allowlist validation: safe IPv4, IPv6, or safe alphanumeric host identifier.
+    // Rejects shell metacharacters, control characters, leading flags, and empty values.
+    var safeValRegex = /^[a-zA-Z0-9:][a-zA-Z0-9.:_-]{0,254}$/
+    if (!safeValRegex.test(rawVal) || rawVal === "unknown") {
+      return
+    }
+
+    var rawLabel = String(label || "value").trim()
+    var safeLabelRegex = /^[a-zA-Z0-9 _-]{1,64}$/
+    var cleanLabel = safeLabelRegex.test(rawLabel) ? rawLabel : "value"
+    var notifMessage = "Copied " + cleanLabel + ": " + rawVal
+
+    // 1. Pass arguments via non-shell vector execution API (no shell interpretation)
+    if (typeof Quickshell !== "undefined" && typeof Quickshell.execDetached === "function") {
+      Quickshell.execDetached(["wl-copy", "--", rawVal])
+      Quickshell.execDetached(["omarchy-notification-send", "-g", "󰒋", "Fleet DM", notifMessage])
+    } else if (typeof Util !== "undefined" && typeof Util.execArgv === "function") {
+      Util.execArgv(["wl-copy", "--", rawVal])
+      Util.execArgv(["omarchy-notification-send", "-g", "󰒋", "Fleet DM", notifMessage])
+    } else if (root.bar && typeof root.bar.run === "function") {
+      // 2. Safe fallback with POSIX single-quote escaping for shell execution
+      var safeQuote = function(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'" }
+      root.bar.run("wl-copy -- " + safeQuote(rawVal))
+      root.bar.run("omarchy-notification-send -g 󰒋 'Fleet DM' " + safeQuote(notifMessage))
     }
   }
 

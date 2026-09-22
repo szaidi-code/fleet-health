@@ -64,7 +64,7 @@ jq -s --arg url "$FLEET_SERVER_URL" '{
     id: .spec.id,
     hostname: .spec.hostname,
     computer_name: (.spec.computer_name // .spec.hostname),
-    ip: (.spec.primary_ip // "unknown"),
+    ip: (if ((.spec.primary_ip // "") | test("^[a-zA-Z0-9:][a-zA-Z0-9.:_-]{0,254}$")) then .spec.primary_ip else "unknown" end),
     status: .spec.status,
     os: (.spec.os_version // "Linux"),
     osquery: (.spec.osquery_version // "unknown"),
