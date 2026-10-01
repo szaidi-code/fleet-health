@@ -70,7 +70,7 @@ ssh user@node "omarchy-fleet-health-report"
 - `fleetctl` configured against your Fleet DM server (otherwise the panel shows Disconnected; use `--demo` to preview)
 - `wl-copy` for click-to-copy
 
-No `sudo` is required; everything installs to user space.
+No root or elevated privileges are required; everything installs to user space.
 
 ## Data Handling & Limits
 
