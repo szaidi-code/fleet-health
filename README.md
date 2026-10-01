@@ -64,12 +64,31 @@ The report script can run on any machine or container with `fleetctl` configured
 ssh user@node "omarchy-fleet-health-report"
 ```
 
+## Requirements
+
+- `python3` (report collector) and `jq` (`omarchy-fleet-status`)
+- `fleetctl` configured against your Fleet DM server (otherwise the panel shows Disconnected; use `--demo` to preview)
+- `wl-copy` for click-to-copy
+
+No `sudo` is required; everything installs to user space.
+
+## Data Handling & Limits
+
+Everything returned by Fleet is treated as untrusted:
+
+- `fleetctl` runs without a shell. Its stdout is read with a fixed byte budget (4 MiB), and the process is killed with a timeout. If output goes over the budget, collection fails closed and the panel shows an error instead of partial data.
+- At most 250 hosts are collected, and lines over 64 KiB are skipped. The emitted report is capped at 2 MiB, and the panel re-checks both limits before parsing.
+- Strings have control characters stripped and are length-capped. Numbers are range-checked, so `NaN`/`Infinity` never reach the JSON. Every dynamic `Text` in the panel uses `Text.PlainText`, so markup in hostnames or OS fields displays literally.
+- Node IPs must match a strict allowlist before they can be copied. Clipboard and notification actions use argument-vector APIs, not shell strings.
+- "Open Web Console" only opens `http://` or `https://` URLs.
+
 ## Installation & Configuration
 
 Install with:
 ```bash
 ./install.sh
 ```
+Helper scripts go to `~/.local/bin` (override with `PREFIX=...`; the panel expects `~/.local/bin`).
 
 Ensure `fleet.health` is included in your bar widgets in `~/.config/omarchy/shell.json`:
 ```json

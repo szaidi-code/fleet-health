@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "fleet.health",
   "name": "Fleet Health",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "szaidi-code",
   "license": "MIT",
   "description": "Fleet DM cluster telemetry, osquery health reports, and node monitoring in the Omarchy bar.",

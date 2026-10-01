@@ -259,6 +259,192 @@ exit 1
             self.assertNotIn("\x00", node["cpu"]["brand"])
             self.assertNotIn("\n", node["kernel"]["version"])
 
+    def _run_with_mock_fleetctl(self, mock_body, timeout=30):
+        with tempfile.TemporaryDirectory() as tmp_bin_dir:
+            mock_fleetctl = Path(tmp_bin_dir) / "fleetctl"
+            mock_fleetctl.write_text("#!/bin/bash\n" + mock_body, encoding="utf-8")
+            mock_fleetctl.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{tmp_bin_dir}:{env['PATH']}"
+            return subprocess.run([str(REPORT_BIN)], env=env, capture_output=True, text=True, timeout=timeout)
+
+    def test_run_bounded_kills_endless_producer(self):
+        """An endless stdout stream must abort at the byte budget, not grow without bound."""
+        with self.assertRaises(report_mod.OutputLimitExceeded):
+            report_mod.run_bounded(["yes", "x" * 1000], max_bytes=256 * 1024, timeout=10)
+        rc, out = report_mod.run_bounded(["printf", "hello"], max_bytes=5, timeout=5)
+        self.assertEqual((rc, out), (0, "hello"))
+        with self.assertRaises(subprocess.TimeoutExpired):
+            report_mod.run_bounded(["sleep", "30"], max_bytes=1024, timeout=0.5)
+
+    def test_oversized_host_response_fails_closed(self):
+        """An oversized `fleetctl get hosts` response fails collection within the byte budget."""
+        mock = """
+if [[ "$*" == *"--version"* ]]; then echo "fleetctl version 4.50.0"; exit 0; fi
+if [[ "$*" == *"get hosts"* ]]; then
+  # Endless stream of valid host records: never terminates on its own.
+  i=0
+  while :; do
+    printf '{"spec":{"id":%d,"hostname":"node-%d","primary_ip":"10.0.0.1","status":"online"}}\\n' "$i" "$i"
+    i=$((i+1))
+  done
+fi
+exit 1
+"""
+        res = self._run_with_mock_fleetctl(mock)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertLessEqual(len(res.stdout.encode()), report_mod.MAX_OUTPUT_BYTES)
+        data = json.loads(res.stdout)
+        self.assertFalse(data["connected"])
+        self.assertEqual(data["nodes"], [])
+        self.assertIn("exceeded size limit", data["error"])
+
+    def test_report_line_parsing_is_linear(self):
+        """Hostile report lines (many braces/keys, no match) are rejected quickly."""
+        import time
+        hostile = ('{"host":' * 8000)[: report_mod.MAX_LINE_CHARS]
+        t = time.monotonic()
+        with self.assertRaises(ValueError):
+            report_mod.extract_report_record(hostile + '"rows":}')
+        self.assertIsNone(report_mod.extract_report_record(hostile))
+        self.assertLess(time.monotonic() - t, 1.0)
+        rec = report_mod.extract_report_record('noise {"host":"a","rows":[{}]} trailing')
+        self.assertEqual(rec["host"], "a")
+
+    def test_oversized_telemetry_report_fails_closed(self):
+        """An oversized `fleetctl report` stream also fails closed within its byte budget."""
+        mock = """
+if [[ "$*" == *"--version"* ]]; then echo "fleetctl version 4.50.0"; exit 0; fi
+if [[ "$*" == *"get hosts"* ]]; then
+  echo '{"spec":{"id":1,"hostname":"node-1","primary_ip":"10.0.0.1","status":"online"}}'; exit 0
+fi
+if [[ "$*" == *"report"* ]]; then exec yes '{"host":"node-1","rows":[{"load_1m":"0.1"}]}'; fi
+exit 1
+"""
+        res = self._run_with_mock_fleetctl(mock)
+        data = json.loads(res.stdout)
+        self.assertFalse(data["connected"])
+        self.assertIn("exceeded size limit", data["error"])
+
+    def test_host_count_is_capped(self):
+        """Within the byte budget, the host list is truncated at MAX_HOSTS."""
+        count = report_mod.MAX_HOSTS + 50
+        mock = f"""
+if [[ "$*" == *"--version"* ]]; then echo "fleetctl version 4.50.0"; exit 0; fi
+if [[ "$*" == *"get hosts"* ]]; then
+  for i in $(seq 1 {count}); do
+    printf '{{"spec":{{"id":%d,"hostname":"node-%d","primary_ip":"10.0.0.1","status":"online"}}}}\\n' "$i" "$i"
+  done
+  exit 0
+fi
+exit 1
+"""
+        res = self._run_with_mock_fleetctl(mock)
+        data = json.loads(res.stdout)
+        self.assertTrue(data["connected"])
+        self.assertEqual(len(data["nodes"]), report_mod.MAX_HOSTS)
+        self.assertEqual(data["summary"]["total_nodes"], report_mod.MAX_HOSTS)
+        self.assertTrue(data["truncated"])
+
+    def test_markup_and_non_finite_values_pass_through_as_data(self):
+        """Markup in Fleet fields is kept as literal text; NaN/huge numbers never reach the JSON."""
+        mock = r"""
+if [[ "$*" == *"--version"* ]]; then echo "fleetctl version 4.50.0"; exit 0; fi
+if [[ "$*" == *"get hosts"* ]]; then
+  echo '{"spec":{"id":{"nested":"x"},"hostname":"<b>controlled</b>","os_version":"<img src=x>","primary_ip":"10.0.0.1","status":"online","cpu_logical_cores":"99999999"}}'
+  exit 0
+fi
+if [[ "$*" == *"report"* ]]; then
+  echo '{"host":"<b>controlled</b>","rows":[{"load_1m":"nan","load_5m":"inf","memory_total":4294967296,"memory_free":1,"cached":1,"uptime_seconds":60,"cpu_brand":"<font color=red>CPU</font>","kernel_version":"<a href=x>6.12</a>"}]}'
+  exit 0
+fi
+exit 1
+"""
+        res = self._run_with_mock_fleetctl(mock)
+        data = json.loads(res.stdout)  # strict parse: NaN/Infinity would still parse in Python, so check below
+        self.assertNotIn("NaN", res.stdout)
+        self.assertNotIn("Infinity", res.stdout)
+        node = data["nodes"][0]
+        self.assertEqual(node["hostname"], "<b>controlled</b>")
+        self.assertEqual(node["os"], "<img src=x>")
+        self.assertEqual(node["cpu"]["brand"], "<font color=red>CPU</font>")
+        self.assertEqual(node["kernel"]["version"], "<a href=x>6.12</a>")
+        self.assertIsNone(node["id"])
+        self.assertEqual(node["cpu"]["cores"], 4)
+        self.assertEqual(node["cpu"]["load_1m"], 0.0)
+
+    def test_panel_qml_dynamic_text_is_plain(self):
+        """Every Text sink that renders non-literal data must use Text.PlainText."""
+        content = (PLUGIN_DIR / "Panel.qml").read_text(encoding="utf-8")
+        lines = content.splitlines()
+        dynamic = 0
+        for i, line in enumerate(lines):
+            m = re.match(r'^\s*text:\s*(.*)$', line)
+            if not m or re.fullmatch(r'"[^"]*"', m.group(1).strip()):
+                continue
+            dynamic += 1
+            block = "\n".join(lines[i:i + 3])
+            self.assertIn("textFormat: Text.PlainText", block, f"Panel.qml:{i + 1} renders dynamic text without Text.PlainText")
+        self.assertGreaterEqual(dynamic, 6)
+        self.assertIn("root.maxReportChars", content)
+        self.assertIn("slice(0, root.maxNodes)", content)
+
+    def test_status_script_bounds_host_output(self):
+        """omarchy-fleet-status must cap fleetctl output and the host list."""
+        status_src = (PLUGIN_DIR / "bin" / "omarchy-fleet-status").read_text(encoding="utf-8")
+        self.assertIn("head -c $((MAX_HOSTS_STDOUT_BYTES + 1))", status_src)
+        self.assertIn(".[:250]", status_src)
+
+    def _run_status_with_mock(self, stdout_line, extra_env=None):
+        with tempfile.TemporaryDirectory() as tmp_bin_dir:
+            mock = Path(tmp_bin_dir) / "fleetctl"
+            mock.write_text("#!/bin/bash\ncat <<'JSON'\n" + stdout_line + "\nJSON\n", encoding="utf-8")
+            mock.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{tmp_bin_dir}:{env['PATH']}"
+            env.update(extra_env or {})
+            res = subprocess.run([str(PLUGIN_DIR / "bin" / "omarchy-fleet-status")], env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            return json.loads(res.stdout)
+
+    def test_status_script_sanitizes_fields(self):
+        """omarchy-fleet-status strips control characters, caps lengths, and keeps markup literal."""
+        line = json.dumps({"spec": {"id": 3, "hostname": "<b>controlled</b>\u0007" + "h" * 300,
+                                    "primary_ip": "10.0.0.1", "status": "online", "os_version": None}})
+        data = self._run_status_with_mock(line)
+        host = data["hosts"][0]
+        self.assertTrue(host["hostname"].startswith("<b>controlled</b>h"))
+        self.assertEqual(len(host["hostname"]), 128)
+        self.assertNotIn("\u0007", host["hostname"])
+        self.assertEqual(host["status"], "online")
+        self.assertEqual(host["os"], "Linux")
+
+    def test_status_script_malformed_and_hostile_url(self):
+        """Malformed Fleet output and a hostile server URL still yield valid, escaped JSON."""
+        data = self._run_status_with_mock("not json", {"FLEET_SERVER_URL": 'x", "pwned": "1'})
+        self.assertFalse(data["connected"])
+        self.assertNotIn("pwned", data)
+        self.assertEqual(data["server_url"], 'x", "pwned": "1')
+
+    def test_panel_console_url_is_restricted(self):
+        """openConsole must only open http(s) URLs."""
+        content = (PLUGIN_DIR / "Panel.qml").read_text(encoding="utf-8")
+        m = re.search(r"function openConsole\(\) \{(.*?)\n  \}", content, re.S)
+        self.assertIsNotNone(m)
+        self.assertIn("/^https?:", m.group(1))
+        self.assertNotIn("Qt.openUrlExternally(serverUrl)", m.group(1))
+
+    def test_install_honours_prefix(self):
+        """install.sh and uninstall.sh agree on a custom PREFIX."""
+        with tempfile.TemporaryDirectory() as tmp_home:
+            env = os.environ.copy()
+            env["HOME"] = tmp_home
+            env["PREFIX"] = f"{tmp_home}/custom-bin"
+            subprocess.run(["bash", str(PLUGIN_DIR / "install.sh")], env=env, check=True, capture_output=True)
+            self.assertTrue((Path(tmp_home) / "custom-bin" / "omarchy-fleet-health-report").is_file())
+            subprocess.run(["bash", str(PLUGIN_DIR / "uninstall.sh")], env=env, check=True, capture_output=True)
+            self.assertFalse((Path(tmp_home) / "custom-bin" / "omarchy-fleet-health-report").exists())
+
     def test_install_and_uninstall_lifecycle(self):
         """Functional test for install.sh and uninstall.sh in an isolated sandbox HOME."""
         with tempfile.TemporaryDirectory() as tmp_home:

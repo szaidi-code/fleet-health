@@ -11,6 +11,19 @@ import sys
 import os
 import datetime
 import argparse
+import selectors
+import time
+
+# Hard ceilings on Fleet-controlled data. Subprocess output beyond the byte
+# budget aborts collection (fail closed); host lists beyond MAX_HOSTS are
+# truncated; lines longer than MAX_LINE_CHARS are skipped; the emitted report
+# must fit in MAX_OUTPUT_BYTES.
+MAX_HOSTS_STDOUT_BYTES = 4 * 1024 * 1024
+MAX_REPORT_STDOUT_BYTES = 4 * 1024 * 1024
+MAX_VERSION_STDOUT_BYTES = 64 * 1024
+MAX_LINE_CHARS = 64 * 1024
+MAX_HOSTS = 250
+MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 
 SAFE_IP_PATTERN = re.compile(r'^[a-zA-Z0-9:][a-zA-Z0-9.:_-]{0,254}$')
 SAFE_STR_PATTERN = re.compile(r'[\x00-\x1f\x7f]')
@@ -28,6 +41,82 @@ def sanitize_text(val, default="unknown", max_len=255):
         return default
     s = SAFE_STR_PATTERN.sub('', str(val)).strip()
     return s[:max_len] if s else default
+
+def sanitize_int(val, default=0, lo=0, hi=2**53):
+    try:
+        n = int(val)
+    except (ValueError, TypeError, OverflowError):
+        return default
+    return n if lo <= n <= hi else default
+
+def sanitize_float(val, default=0.0, lo=0.0, hi=1e6):
+    try:
+        f = float(val)
+    except (ValueError, TypeError, OverflowError):
+        return default
+    return f if lo <= f <= hi else default
+
+class OutputLimitExceeded(Exception):
+    pass
+
+def run_bounded(argv, max_bytes, timeout):
+    """Run argv without a shell, reading at most max_bytes of stdout.
+
+    Raises OutputLimitExceeded as soon as stdout exceeds max_bytes and
+    subprocess.TimeoutExpired once timeout seconds elapse; the child is
+    killed in both cases. stderr is discarded rather than buffered.
+    """
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + timeout
+    buf = bytearray()
+    try:
+        with selectors.DefaultSelector() as sel:
+            sel.register(proc.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                if not sel.select(remaining):
+                    continue
+                chunk = os.read(proc.stdout.fileno(), min(65536, max_bytes + 1 - len(buf)))
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > max_bytes:
+                    raise OutputLimitExceeded(f"{argv[0]} output exceeded {max_bytes} bytes")
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        proc.stdout.close()
+    return proc.returncode, buf.decode("utf-8", errors="replace")
+
+def extract_report_record(line):
+    """Return the JSON object embedded in a `fleetctl report` output line, or None.
+
+    Linear-time slice from the first '{' to the last '}' (a backtracking regex
+    here is super-linear on hostile input).
+    """
+    start = line.find("{")
+    end = line.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    candidate = line[start:end + 1]
+    if '"host":' not in candidate or '"rows":' not in candidate:
+        return None
+    rec = json.loads(candidate)
+    return rec if isinstance(rec, dict) else None
+
+def disconnected_report(now_iso, server_url, error, status="Disconnected"):
+    return {
+        "timestamp": now_iso,
+        "server_url": server_url,
+        "connected": False,
+        "error": error,
+        "summary": {"total_nodes": 0, "online_nodes": 0, "offline_nodes": 0, "status": status},
+        "nodes": []
+    }
 
 def resolve_fleet_url(override=None):
     if override:
@@ -192,119 +281,107 @@ def get_fleet_data(server_url, timeout_sec=8):
 
     # 1. Check if fleetctl is installed
     try:
-        ver_chk = subprocess.run(["fleetctl", "--version"], capture_output=True, text=True)
-        if ver_chk.returncode != 0:
-            return {
-                "timestamp": now_iso,
-                "server_url": server_url,
-                "connected": False,
-                "error": "fleetctl command failed or not configured",
-                "summary": {"total_nodes": 0, "online_nodes": 0, "offline_nodes": 0, "status": "Disconnected"},
-                "nodes": []
-            }
+        ver_rc, _ = run_bounded(["fleetctl", "--version"], MAX_VERSION_STDOUT_BYTES, timeout=5)
+        if ver_rc != 0:
+            return disconnected_report(now_iso, server_url, "fleetctl command failed or not configured")
     except FileNotFoundError:
-        return {
-            "timestamp": now_iso,
-            "server_url": server_url,
-            "connected": False,
-            "error": "fleetctl binary not found in PATH",
-            "summary": {"total_nodes": 0, "online_nodes": 0, "offline_nodes": 0, "status": "Disconnected"},
-            "nodes": []
-        }
+        return disconnected_report(now_iso, server_url, "fleetctl binary not found in PATH")
+    except (OutputLimitExceeded, subprocess.TimeoutExpired):
+        return disconnected_report(now_iso, server_url, "fleetctl command failed or not configured")
 
     # 2. Query basic host information
     hosts = {}
+    truncated = False
     try:
-        hosts_res = subprocess.run(["fleetctl", "get", "hosts", "--json"], capture_output=True, text=True, timeout=10)
-        if hosts_res.returncode == 0 and hosts_res.stdout.strip():
-            for line in hosts_res.stdout.strip().split("\n"):
-                if not line:
-                    continue
-                try:
-                    item = json.loads(line)
-                    spec = item.get("spec", {})
-                    h_name = sanitize_text(spec.get("hostname"), default="", max_len=128)
-                    if h_name:
-                        mem_val = spec.get("memory", 0)
-                        try:
-                            mem_bytes = int(mem_val)
-                        except (ValueError, TypeError):
-                            mem_bytes = 0
-                        hosts[h_name] = {
-                            "id": spec.get("id"),
-                            "hostname": h_name,
-                            "display_name": sanitize_text(spec.get("computer_name") or spec.get("display_name") or h_name, default=h_name, max_len=128),
-                            "ip": sanitize_ip(spec.get("primary_ip")),
-                            "status": sanitize_text(spec.get("status", "unknown"), default="unknown", max_len=32),
-                            "os": sanitize_text(spec.get("os_version", "Arch Linux"), default="Arch Linux", max_len=64),
-                            "osquery": sanitize_text(spec.get("osquery_version", "5.23.1"), default="5.23.1", max_len=32),
-                            "disk_free_percent": int(spec.get("percent_disk_space_available", 0)) if str(spec.get("percent_disk_space_available", 0)).isdigit() else 0,
-                            "cpu": {
-                                "brand": sanitize_text(spec.get("cpu_brand") or "AMD Ryzen", default="AMD Ryzen", max_len=128),
-                                "cores": int(spec.get("cpu_logical_cores", 4)) if str(spec.get("cpu_logical_cores", 4)).isdigit() else 4,
-                                "load_1m": 0.0,
-                                "load_5m": 0.0
-                            },
-                            "memory": {
-                                "total_mb": round(mem_bytes / (1024 * 1024)) if mem_bytes > 0 else 4096,
-                                "used_mb": 0,
-                                "free_mb": 0,
-                                "cached_mb": 0,
-                                "percent": 0.0
-                            },
-                            "kernel": {
-                                "version": "unknown",
-                                "arguments": "",
-                                "uptime_human": "",
-                                "uptime_seconds": 0
-                            }
-                        }
-                except Exception:
-                    pass
+        hosts_rc, hosts_out = run_bounded(["fleetctl", "get", "hosts", "--json"], MAX_HOSTS_STDOUT_BYTES, timeout=10)
+    except OutputLimitExceeded:
+        return disconnected_report(now_iso, server_url, "Fleet host list exceeded size limit", status="Offline")
     except Exception:
-        pass
+        hosts_rc, hosts_out = 1, ""
+
+    if hosts_rc == 0 and hosts_out.strip():
+        for line in hosts_out.strip().split("\n"):
+            if not line or len(line) > MAX_LINE_CHARS:
+                continue
+            if len(hosts) >= MAX_HOSTS:
+                truncated = True
+                break
+            try:
+                item = json.loads(line)
+                spec = item.get("spec", {})
+                h_name = sanitize_text(spec.get("hostname"), default="", max_len=128)
+                if h_name:
+                    mem_bytes = sanitize_int(spec.get("memory", 0))
+                    hosts[h_name] = {
+                        "id": sanitize_int(spec.get("id"), default=None),
+                        "hostname": h_name,
+                        "display_name": sanitize_text(spec.get("computer_name") or spec.get("display_name") or h_name, default=h_name, max_len=128),
+                        "ip": sanitize_ip(spec.get("primary_ip")),
+                        "status": sanitize_text(spec.get("status", "unknown"), default="unknown", max_len=32),
+                        "os": sanitize_text(spec.get("os_version", "Arch Linux"), default="Arch Linux", max_len=64),
+                        "osquery": sanitize_text(spec.get("osquery_version", "5.23.1"), default="5.23.1", max_len=32),
+                        "disk_free_percent": sanitize_int(spec.get("percent_disk_space_available", 0), hi=100),
+                        "cpu": {
+                            "brand": sanitize_text(spec.get("cpu_brand") or "AMD Ryzen", default="AMD Ryzen", max_len=128),
+                            "cores": sanitize_int(spec.get("cpu_logical_cores", 4), default=4, lo=1, hi=4096),
+                            "load_1m": 0.0,
+                            "load_5m": 0.0
+                        },
+                        "memory": {
+                            "total_mb": round(mem_bytes / (1024 * 1024)) if mem_bytes > 0 else 4096,
+                            "used_mb": 0,
+                            "free_mb": 0,
+                            "cached_mb": 0,
+                            "percent": 0.0
+                        },
+                        "kernel": {
+                            "version": "unknown",
+                            "arguments": "",
+                            "uptime_human": "",
+                            "uptime_seconds": 0
+                        }
+                    }
+            except Exception:
+                pass
 
     if not hosts:
-        return {
-            "timestamp": now_iso,
-            "server_url": server_url,
-            "connected": False,
-            "error": "No hosts registered or Fleet server unreachable",
-            "summary": {"total_nodes": 0, "online_nodes": 0, "offline_nodes": 0, "status": "Offline"},
-            "nodes": []
-        }
+        return disconnected_report(now_iso, server_url, "No hosts registered or Fleet server unreachable", status="Offline")
 
     # 3. Query live osquery telemetry via saved report 'fleet_health_report'
     try:
         timeout_arg = f"{int(timeout_sec)}s"
-        rep_res = subprocess.run(
-            ["fleetctl", "report", "--report-name", "fleet_health_report", "--labels", "All Hosts", "--timeout", timeout_arg],
-            capture_output=True, text=True, timeout=timeout_sec + 4
-        )
-        if rep_res.stdout:
-            for line in rep_res.stdout.split("\n"):
-                match = re.search(r"\{.*\"host\":.*\"rows\":.*\}", line)
-                if not match:
+        try:
+            _, rep_out = run_bounded(
+                ["fleetctl", "report", "--report-name", "fleet_health_report", "--labels", "All Hosts", "--timeout", timeout_arg],
+                MAX_REPORT_STDOUT_BYTES, timeout=timeout_sec + 4
+            )
+        except OutputLimitExceeded:
+            return disconnected_report(now_iso, server_url, "Fleet telemetry report exceeded size limit", status="Offline")
+        if rep_out:
+            for line in rep_out.split("\n"):
+                if len(line) > MAX_LINE_CHARS:
                     continue
                 try:
-                    rec = json.loads(match.group(0))
+                    rec = extract_report_record(line)
+                    if rec is None:
+                        continue
                     h_name = rec.get("host")
                     rows = rec.get("rows", [])
-                    if h_name in hosts and rows:
+                    if isinstance(h_name, str) and h_name in hosts and isinstance(rows, list) and rows and isinstance(rows[0], dict):
                         r = rows[0]
-                        mem_tot = int(r.get("memory_total", 0))
-                        mem_free = int(r.get("memory_free", 0))
-                        mem_cached = int(r.get("cached", 0))
+                        mem_tot = sanitize_int(r.get("memory_total", 0))
+                        mem_free = sanitize_int(r.get("memory_free", 0))
+                        mem_cached = sanitize_int(r.get("cached", 0))
                         mem_used = max(0, mem_tot - mem_free - mem_cached)
                         mem_pct = round((mem_used / mem_tot) * 100, 1) if mem_tot > 0 else 0
-                        uptime_s = int(r.get("uptime_seconds", 0))
+                        uptime_s = sanitize_int(r.get("uptime_seconds", 0))
                         days = uptime_s // 86400
                         hours = (uptime_s % 86400) // 3600
                         mins = (uptime_s % 3600) // 60
                         uptime_str = f"{days}d {hours}h {mins}m" if days > 0 else f"{hours}h {mins}m"
 
-                        hosts[h_name]["cpu"]["load_1m"] = round(float(r.get("load_1m", 0)), 2)
-                        hosts[h_name]["cpu"]["load_5m"] = round(float(r.get("load_5m", 0)), 2)
+                        hosts[h_name]["cpu"]["load_1m"] = round(sanitize_float(r.get("load_1m", 0)), 2)
+                        hosts[h_name]["cpu"]["load_5m"] = round(sanitize_float(r.get("load_5m", 0)), 2)
                         if r.get("cpu_brand"):
                             hosts[h_name]["cpu"]["brand"] = sanitize_text(r.get("cpu_brand"), default="AMD Ryzen", max_len=128)
                         if mem_tot > 0:
@@ -360,8 +437,16 @@ def get_fleet_data(server_url, timeout_sec=8):
             "kernel_version": kernel_display,
             "status": cluster_status
         },
-        "nodes": node_list
+        "nodes": node_list,
+        "truncated": truncated
     }
+
+def render_report(report):
+    out = json.dumps(report, indent=2)
+    if len(out.encode("utf-8")) > MAX_OUTPUT_BYTES:
+        fallback = disconnected_report(report.get("timestamp"), report.get("server_url"), "Fleet report exceeded size limit", status="Offline")
+        out = json.dumps(fallback, indent=2)
+    return out
 
 def main():
     parser = argparse.ArgumentParser(description="Omarchy Fleet DM Health Report")
@@ -377,7 +462,7 @@ def main():
     else:
         report = get_fleet_data(server_url, timeout_sec=args.timeout)
 
-    print(json.dumps(report, indent=2))
+    print(render_report(report))
 
 if __name__ == "__main__":
     main()

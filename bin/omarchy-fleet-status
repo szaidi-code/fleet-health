@@ -22,53 +22,54 @@ resolve_fleet_url() {
 
 FLEET_SERVER_URL="$(resolve_fleet_url)"
 
-if ! command -v fleetctl >/dev/null 2>&1; then
-  cat <<'EOF'
-{
-  "connected": false,
-  "server_url": "",
-  "total_hosts": 0,
-  "online_hosts": 0,
-  "offline_hosts": 0,
-  "hosts": [],
-  "error": "fleetctl command not found in PATH"
-}
-EOF
+disconnected() {
+  jq -n --arg url "$1" --arg error "$2" '{
+    connected: false,
+    server_url: $url,
+    total_hosts: 0,
+    online_hosts: 0,
+    offline_hosts: 0,
+    hosts: [],
+    error: $error
+  }'
   exit 0
+}
+
+# Hard ceiling on Fleet-controlled data (see omarchy-fleet-health-report);
+# the jq filter below also caps the host list at 250 entries.
+MAX_HOSTS_STDOUT_BYTES=$((4 * 1024 * 1024))
+
+if ! command -v fleetctl >/dev/null 2>&1; then
+  disconnected "" "fleetctl command not found in PATH"
 fi
 
-raw_hosts=$(fleetctl get hosts --json 2>/dev/null || true)
+raw_hosts=$(timeout 10 fleetctl get hosts --json 2>/dev/null | head -c $((MAX_HOSTS_STDOUT_BYTES + 1)) || true)
+
+if (( $(printf '%s' "$raw_hosts" | wc -c) > MAX_HOSTS_STDOUT_BYTES )); then
+  disconnected "$FLEET_SERVER_URL" "Fleet host list exceeded size limit"
+fi
 
 if [[ -z "$raw_hosts" ]]; then
-  cat <<EOF
-{
-  "connected": false,
-  "server_url": "$FLEET_SERVER_URL",
-  "total_hosts": 0,
-  "online_hosts": 0,
-  "offline_hosts": 0,
-  "hosts": [],
-  "error": "Unable to connect to Fleet DM server"
-}
-EOF
-  exit 0
+  disconnected "$FLEET_SERVER_URL" "Unable to connect to Fleet DM server"
 fi
 
-jq -s --arg url "$FLEET_SERVER_URL" '{
+jq -s --arg url "$FLEET_SERVER_URL" 'def clean(n; d): if . == null then d else (tostring | gsub("[\u0000-\u001f\u007f]"; "") | .[:n]) end;
+def num: if type == "number" and isinfinite == false and isnan == false then . else 0 end;
+.[:250] | {
   connected: true,
   server_url: $url,
   total_hosts: length,
   online_hosts: ([.[] | select(.spec.status == "online")] | length),
   offline_hosts: ([.[] | select(.spec.status != "online")] | length),
   hosts: [.[] | {
-    id: .spec.id,
-    hostname: .spec.hostname,
-    computer_name: (.spec.computer_name // .spec.hostname),
-    ip: (if ((.spec.primary_ip // "") | test("^[a-zA-Z0-9:][a-zA-Z0-9.:_-]{0,254}$")) then .spec.primary_ip else "unknown" end),
-    status: .spec.status,
-    os: (.spec.os_version // "Linux"),
-    osquery: (.spec.osquery_version // "unknown"),
-    issues: ((.spec.issues.total_issues_count) // 0),
-    disk_free_percent: ((.spec.percent_disk_space_available) // 0)
+    id: (.spec.id | num),
+    hostname: (.spec.hostname | clean(128; "")),
+    computer_name: ((.spec.computer_name // .spec.hostname) | clean(128; "")),
+    ip: (if ((.spec.primary_ip // "") | tostring | test("^[a-zA-Z0-9:][a-zA-Z0-9.:_-]{0,254}$")) then .spec.primary_ip else "unknown" end),
+    status: (.spec.status | clean(32; "unknown")),
+    os: (.spec.os_version | clean(64; "Linux")),
+    osquery: (.spec.osquery_version | clean(32; "unknown")),
+    issues: ((.spec.issues.total_issues_count) // 0 | num),
+    disk_free_percent: ((.spec.percent_disk_space_available) // 0 | num)
   }]
-}' <<<"$raw_hosts"
+}' <<<"$raw_hosts" 2>/dev/null || disconnected "$FLEET_SERVER_URL" "Fleet returned malformed host data"

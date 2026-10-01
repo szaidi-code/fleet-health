@@ -35,6 +35,10 @@ Panel {
   property string statusError: ""
   property string activeTab: "all" // "all" or specific host
 
+  // Must stay >= the collector's MAX_OUTPUT_BYTES / MAX_HOSTS ceilings.
+  readonly property int maxReportChars: 2 * 1024 * 1024
+  readonly property int maxNodes: 250
+
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
@@ -48,7 +52,8 @@ Panel {
   }
 
   function openConsole() {
-    Qt.openUrlExternally(serverUrl)
+    var url = String(serverUrl || "").trim()
+    if (/^https?:\/\/[^\s]+$/i.test(url) && url.length <= 2048) Qt.openUrlExternally(url)
     root.close()
   }
 
@@ -90,7 +95,9 @@ Panel {
       waitForEnd: true
       onStreamFinished: {
         try {
-          var data = JSON.parse(String(text || "").trim())
+          var raw = String(text || "")
+          if (raw.length > root.maxReportChars) throw new Error("Fleet report exceeded size limit")
+          var data = JSON.parse(raw.trim())
           root.connected = data.connected === true
           root.serverUrl = data.server_url || root.serverUrl
           var sum = data.summary || {}
@@ -103,7 +110,7 @@ Panel {
           root.usedRamGb = sum.used_ram_gb || 0.0
           root.ramPercent = sum.ram_percent || 0.0
           root.kernelVersion = sum.kernel_version || "Linux"
-          root.nodes = data.nodes || []
+          root.nodes = Array.isArray(data.nodes) ? data.nodes.slice(0, root.maxNodes) : []
           root.statusError = data.error || ""
         } catch (e) {
           root.connected = false
@@ -211,6 +218,7 @@ Panel {
 
                   Text {
                     text: root.connected ? (root.serverUrl + " • " + root.onlineNodes + "/" + root.totalNodes + " nodes online") : (root.statusError || "Disconnected")
+                    textFormat: Text.PlainText
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                     color: root.dim
@@ -229,6 +237,7 @@ Panel {
                     id: statusBadgeText
                     anchors.centerIn: parent
                     text: root.clusterStatus.toUpperCase()
+                    textFormat: Text.PlainText
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                     font.bold: true
@@ -261,6 +270,7 @@ Panel {
                     }
                     Text {
                       text: root.avgLoad1m.toFixed(2)
+                      textFormat: Text.PlainText
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
                       font.bold: true
@@ -289,6 +299,7 @@ Panel {
                     }
                     Text {
                       text: root.ramPercent.toFixed(1) + "% (" + root.usedRamGb + "G)"
+                      textFormat: Text.PlainText
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
                       font.bold: true
@@ -317,6 +328,7 @@ Panel {
                     }
                     Text {
                       text: root.kernelVersion
+                      textFormat: Text.PlainText
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
                       font.bold: true
@@ -335,6 +347,7 @@ Panel {
 
             Text {
               text: "Cluster Nodes (" + root.nodes.length + ")"
+              textFormat: Text.PlainText
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
               font.bold: true
@@ -375,6 +388,7 @@ Panel {
 
                   Text {
                     text: "󰌢 " + modelData.hostname
+                    textFormat: Text.PlainText
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
                     font.bold: true
@@ -385,6 +399,7 @@ Panel {
 
                   Text {
                     text: modelData.ip
+                    textFormat: Text.PlainText
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                     color: root.dim
@@ -392,6 +407,7 @@ Panel {
 
                   Text {
                     text: "• " + modelData.status.toUpperCase()
+                    textFormat: Text.PlainText
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                     font.bold: true
@@ -402,6 +418,7 @@ Panel {
                 // OS & Kernel line
                 Text {
                   text: "Kernel " + modelData.kernel.version + " • Uptime: " + (modelData.kernel.uptime_human || "online") + " • " + modelData.os + " (osquery " + modelData.osquery + ")"
+                  textFormat: Text.PlainText
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   color: root.dim
@@ -418,6 +435,7 @@ Panel {
                     width: parent.width
                     Text {
                       text: "CPU: " + modelData.cpu.brand + " (" + modelData.cpu.cores + " cores)"
+                      textFormat: Text.PlainText
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
                       color: root.foreground
@@ -426,6 +444,7 @@ Panel {
                     }
                     Text {
                       text: "Load: " + modelData.cpu.load_1m.toFixed(2) + " (1m) / " + modelData.cpu.load_5m.toFixed(2) + " (5m)"
+                      textFormat: Text.PlainText
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
                       color: root.dim
@@ -456,6 +475,7 @@ Panel {
                     width: parent.width
                     Text {
                       text: "Memory: " + modelData.memory.used_mb + " MB used / " + modelData.memory.total_mb + " MB (" + modelData.memory.percent + "%)"
+                      textFormat: Text.PlainText
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
                       color: root.foreground
@@ -463,6 +483,7 @@ Panel {
                     }
                     Text {
                       text: "Free: " + modelData.memory.free_mb + " MB • Cached: " + modelData.memory.cached_mb + " MB"
+                      textFormat: Text.PlainText
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
                       color: root.dim
